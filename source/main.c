@@ -80,7 +80,8 @@ int rebuild_url(const char *current_url, const char *redirect_location, char *ne
     }
 
     if (strstr(redirect_location, "http://") || strstr(redirect_location, "https://")) {
-        strcpy(new_url, redirect_location);  // Absolute URL
+        strncpy(new_url, redirect_location, BUFFER_SIZE - 1);
+        new_url[BUFFER_SIZE - 1] = '\0';   // Absolute URL
     } else {
         // Get base URL (scheme + host)
         char base_url[BUFFER_SIZE];
@@ -196,7 +197,7 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
                     printf("Status Code : %d\n",status_code);
 
                     // Check for redirect
-                    if (strstr(response, "HTTP/1.1 301") || strstr(response, "HTTP/1.1 302")) {
+                    if (status_code == 301 || status_code == 302) {
                         *is_redirect = 1;
                         char *location = strstr(response, "Location:");
                         if (location) {
@@ -242,7 +243,7 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
                     printf("Status Code : %d\n",status_code);
 
                     // Check for redirect
-                    if (strstr(response, "HTTP/1.1 301") || strstr(response, "HTTP/1.1 302")) {
+                    if (status_code == 301 || status_code == 302) {
                         *is_redirect = 1;
                         char *location = strstr(response, "Location:");
                         if (location) {
@@ -365,17 +366,10 @@ int write_links(const char *filename, const char *links) {
     return SUCCESS;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <URL> <output_file_name(example.txt / example.html)>\n", argv[0]);
-        return ERR_PARAM;
-    }
-
-    char url[BUFFER_SIZE];
-    const char *output_file = argv[2]; 
-
-    strncpy(url, argv[1], BUFFER_SIZE);
-    url[BUFFER_SIZE - 1] = '\0'; 
+int get_url_content(const char *url, const char *output_file) {
+    char current_url[BUFFER_SIZE];
+    strncpy(current_url, url, BUFFER_SIZE);
+    current_url[BUFFER_SIZE - 1] = '\0';  // Ensure null termination
 
     char response[BUFFER_SIZE];
     char redirect_location[BUFFER_SIZE];
@@ -393,8 +387,8 @@ int main(int argc, char *argv[]) {
     // Loop to handle redirects
     do {
         is_redirect = 0;
-        printf("Fetching URL: %s\n", url);
-        int fetch_result = fetch_url(url, response, file, &is_redirect, redirect_location);
+        printf("Fetching URL: %s\n", current_url);
+        int fetch_result = fetch_url(current_url, response, file, &is_redirect, redirect_location);
         if (fetch_result != SUCCESS) {
             fprintf(stderr, "Error fetching URL: %d\n", fetch_result);
             fclose(file);
@@ -403,20 +397,20 @@ int main(int argc, char *argv[]) {
 
         if (is_redirect) {
             printf("Redirecting to: %s\n", redirect_location);
-            int rebuild_result = rebuild_url(url, redirect_location, new_url);
+            int rebuild_result = rebuild_url(current_url, redirect_location, new_url);
             if (rebuild_result != SUCCESS) {
                 fprintf(stderr, "Error rebuilding URL: %d\n", rebuild_result);
                 fclose(file);
                 return rebuild_result;
             }
-            strncpy(url, new_url, BUFFER_SIZE);  // Update the URL to the new location
-            url[BUFFER_SIZE - 1] = '\0';  // Ensure null termination
+            strncpy(current_url, new_url, BUFFER_SIZE);  // Update the URL to the new location
+            current_url[BUFFER_SIZE - 1] = '\0';  // Ensure null termination
             redirect_count++;
         }
     } while (is_redirect && redirect_count < MAX_REDIRECTS);
 
     fclose(file);
-    
+
     if (redirect_count >= MAX_REDIRECTS) {
         printf("Too many redirects\n");
         return ERR_REDIRECT;
@@ -429,7 +423,7 @@ int main(int argc, char *argv[]) {
     printf("\nFetching links...\n\n");
     if (links != NULL) {
         printf("All Links:\n%s", links);
-        
+
         // Write links to links.txt
         int result = write_links("links.txt", links);
         if (result == SUCCESS) {
@@ -442,4 +436,13 @@ int main(int argc, char *argv[]) {
     }
 
     return SUCCESS;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <URL> <output_file_name(example.txt / example.html)>\n", argv[0]);
+        return ERR_PARAM;
+    }
+
+    return get_url_content(argv[1], argv[2]);
 }
