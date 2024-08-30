@@ -56,7 +56,7 @@ int is_https(const char *url, char *hostname, char *path, char *request) {
         snprintf(request, BUFFER_SIZE, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, hostname);
         return 0;  // HTTP
     } else {
-        fprintf(stderr, "Invalid URL format\n");
+        fprintf(stderr, "Invalid URL format, use http:// or https://\n");
         return ERR_URL;
     }
 }
@@ -271,11 +271,11 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
     return SUCCESS;
 }
 
-void extract_links(const char *filename) {
+char *extract_links(const char *filename) {
     FILE *file = fopen(filename, "r");
     if (!file) {
         perror("Error opening file");
-        return;
+        return NULL;
     }
 
     // Read the entire file into a buffer
@@ -287,7 +287,7 @@ void extract_links(const char *filename) {
     if (!buffer) {
         perror("Error allocating memory");
         fclose(file);
-        return;
+        return NULL;
     }
 
     fread(buffer, 1, file_size, file);
@@ -298,29 +298,44 @@ void extract_links(const char *filename) {
     const char *pattern = "<a\\s+[^>]*href=[\"']([^\"']*)[\"']";
 
     regex_t regex;
-    regmatch_t matches[2];  // Array to store the match groups (full match and the captured group)
+    regmatch_t matches[2];
     if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
         perror("Error compiling regex");
         free(buffer);
-        return;
+        return NULL;
     }
+
+    // String to accumulate all links found
+    char *all_links = malloc(1);  // Start with an empty string
+    all_links[0] = '\0';  // Null-terminate the empty string
 
     char *cursor = buffer;
     while (regexec(&regex, cursor, 2, matches, 0) == 0) {
-        // Extract the href value
         int href_start = matches[1].rm_so;
         int href_end = matches[1].rm_eo;
         int href_length = href_end - href_start;
 
-        char href_value[href_length + 1];
+        // Allocate memory for the link and copy the href value
+        char *href_value = malloc(href_length + 1);
         strncpy(href_value, cursor + href_start, href_length);
         href_value[href_length] = '\0';  // Null-terminate the href value
 
-        // Check if the href_value starts with "http://" or "https://"
-        if (strncmp(href_value, "http://", 7) == 0 || strncmp(href_value, "https://", 8) == 0) {
-            // Print the extracted href value if it starts with http or https
-            printf("Found link: %s\n", href_value);
+        // Reallocate all_links to hold the new link plus a newline character
+        size_t current_length = strlen(all_links);
+        all_links = realloc(all_links, current_length + href_length + 2);  // +2 for newline and null terminator
+        if (!all_links) {
+            perror("Error reallocating memory for all_links");
+            regfree(&regex);
+            free(buffer);
+            free(href_value);
+            return NULL;
         }
+
+        // Append the new link and a newline to all_links
+        strcat(all_links, href_value);
+        strcat(all_links, "\n");
+
+        free(href_value);  // Free the temporary link
 
         // Move cursor past the current match
         cursor += matches[0].rm_eo;
@@ -328,6 +343,26 @@ void extract_links(const char *filename) {
 
     regfree(&regex);
     free(buffer);
+
+    return all_links;
+}
+
+int write_links(const char *filename, const char *links) {
+    if (filename == NULL || links == NULL) {
+        return ERR_PARAM;  // Handle invalid parameters
+    }
+
+    FILE *file = fopen(filename, "w");
+    if (!file) {
+        perror("Error opening file to write links");
+        return ERR_FILE;
+    }
+
+    // Write all links to the file
+    fprintf(file, "%s", links);
+
+    fclose(file);
+    return SUCCESS;
 }
 
 int main(int argc, char *argv[]) {
@@ -389,7 +424,22 @@ int main(int argc, char *argv[]) {
 
     printf("Response written to: %s\n", output_file);
 
-    extract_links(output_file);
+    char *links = extract_links(output_file);
+
+    printf("\nFetching links...\n\n");
+    if (links != NULL) {
+        printf("All Links:\n%s", links);
+        
+        // Write links to links.txt
+        int result = write_links("links.txt", links);
+        if (result == SUCCESS) {
+            printf("Links successfully written to links.txt\n");
+        } else {
+            printf("Error writing links to links.txt\n");
+        }
+
+        free(links);
+    }
 
     return SUCCESS;
 }
