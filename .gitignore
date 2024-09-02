@@ -1,3 +1,5 @@
 .vscode/
-*.txt
+*s.txt
 *.o
+source/*.o
+source/*s.txt

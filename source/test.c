@@ -10,7 +10,7 @@
 #include <regex.h>
 
 #define MAX_REDIRECTS 5
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 8192
 
 #define SUCCESS        0
 #define ERR_BASE       0
@@ -22,6 +22,45 @@
 #define ERR_FILE      (ERR_BASE - 6)
 #define ERR_GAI       (ERR_BASE - 7)
 #define ERR_STAT_CODE (ERR_BASE - 8)
+
+typedef struct url_node {
+    char url[BUFFER_SIZE];
+    struct url_node *next;
+} url_node;
+
+struct url_node *url_list = NULL;
+char base_url[BUFFER_SIZE] = {0}; // To store the base URL
+
+void append_url(url_node **head, const char *url) {
+    url_node *new_node = malloc(sizeof(url_node));
+    strncpy(new_node->url, url, BUFFER_SIZE);
+    new_node->next = NULL;
+
+    if (*head == NULL) {
+        *head = new_node;
+    } else {
+        url_node *current = *head;
+        while (current->next != NULL) {
+            current = current->next;
+        }
+        current->next = new_node;
+    }
+}
+
+void rebuild_and_append_url(const char *href) {
+    char full_url[BUFFER_SIZE];
+    
+    // Check if the href is a relative link or an absolute link
+    if (strstr(href, "http://") || strstr(href, "https://")) {
+        // Absolute URL, no need to modify
+        strncpy(full_url, href, BUFFER_SIZE);
+    } else {
+        // Relative URL, combine with base_url
+        snprintf(full_url, BUFFER_SIZE, "%s%s", base_url, href);
+    }
+
+    append_url(&url_list, full_url);
+}
 
 int parse_url(const char *url, char *hostname, char *path) {
     if (url == NULL || hostname == NULL || path == NULL) {
@@ -56,7 +95,7 @@ int is_https(const char *url, char *hostname, char *path, char *request) {
         snprintf(request, BUFFER_SIZE, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, hostname);
         return 0;  // HTTP
     } else {
-        fprintf(stderr, "Invalid URL format\n");
+        fprintf(stderr, "Invalid URL format, use http:// or https://\n");
         return ERR_URL;
     }
 }
@@ -80,25 +119,25 @@ int rebuild_url(const char *current_url, const char *redirect_location, char *ne
     }
 
     if (strstr(redirect_location, "http://") || strstr(redirect_location, "https://")) {
-        strcpy(new_url, redirect_location);  // Absolute URL
+        // If the redirect location is an absolute URL
+        strncpy(new_url, redirect_location, BUFFER_SIZE - 1);
+        new_url[BUFFER_SIZE - 1] = '\0';
     } else {
-        // Get base URL (scheme + host)
-        char base_url[BUFFER_SIZE];
-        const char *path_start = strstr(current_url, "//");
-        if (path_start) {
-            path_start = strchr(path_start + 2, '/');
-            if (path_start) {
-                strncpy(base_url, current_url, path_start - current_url);
-                base_url[path_start - current_url] = '\0';
-            } else {
-                strcpy(base_url, current_url);  // No path, so base URL is the full URL
-            }
-        } else {
-            strcpy(base_url, current_url);
+        // Get base URL (scheme + host + optional port)
+        const char *scheme_end = strstr(current_url, "://");
+        if (!scheme_end) return ERR_URL;
+
+        scheme_end += 3; // Skip past "://"
+        const char *path_start = strchr(scheme_end, '/');
+        size_t base_length = path_start ? (path_start - current_url) : strlen(current_url);
+
+        if (base_length + strlen(redirect_location) >= BUFFER_SIZE) {
+            return ERR_URL;
         }
 
-        // Append the relative location to the base URL
-        snprintf(new_url, BUFFER_SIZE, "%s%s", base_url, redirect_location);
+        strncpy(new_url, current_url, base_length);
+        new_url[base_length] = '\0';
+        strncat(new_url, redirect_location, BUFFER_SIZE - base_length - 1);
     }
 
     return SUCCESS;
@@ -196,7 +235,7 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
                     printf("Status Code : %d\n",status_code);
 
                     // Check for redirect
-                    if (strstr(response, "HTTP/1.1 301") || strstr(response, "HTTP/1.1 302")) {
+                    if (status_code == 301 || status_code == 302) {
                         *is_redirect = 1;
                         char *location = strstr(response, "Location:");
                         if (location) {
@@ -242,7 +281,7 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
                     printf("Status Code : %d\n",status_code);
 
                     // Check for redirect
-                    if (strstr(response, "HTTP/1.1 301") || strstr(response, "HTTP/1.1 302")) {
+                    if (status_code == 301 || status_code == 302) {
                         *is_redirect = 1;
                         char *location = strstr(response, "Location:");
                         if (location) {
@@ -271,7 +310,83 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
     return SUCCESS;
 }
 
-void extract_links(const char *filename) {
+char *extract_links(const char *filename) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        perror("Error opening file");
+        return NULL;
+    }
+
+    // Read the entire file into a buffer
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char *buffer = malloc(file_size + 1);
+    if (!buffer) {
+        perror("Error allocating memory");
+        fclose(file);
+        return NULL;
+    }
+
+    fread(buffer, 1, file_size, file);
+    buffer[file_size] = '\0';
+    fclose(file);
+
+    // Regex pattern to match <a href=...> where the href may or may not be in quotes
+    const char *pattern = "<a\\s+href=[\"']?([^\"' >]+)[\"' >]";
+
+    regex_t regex;
+    regmatch_t matches[2];
+    if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
+        perror("Error compiling regex");
+        free(buffer);
+        return NULL;
+    }
+
+    // String to accumulate all links found
+    char *all_links = malloc(1);  // Start with an empty string
+    all_links[0] = '\0';  // Null-terminate the empty string
+
+    char *cursor = buffer;
+    while (regexec(&regex, cursor, 2, matches, 0) == 0) {
+        int href_start = matches[1].rm_so;
+        int href_end = matches[1].rm_eo;
+        int href_length = href_end - href_start;
+
+        // Allocate memory for the link and copy the href value
+        char *href_value = malloc(href_length + 1);
+        strncpy(href_value, cursor + href_start, href_length);
+        href_value[href_length] = '\0';  // Null-terminate the href value
+
+        // Reallocate all_links to hold the new link plus a newline character
+        size_t current_length = strlen(all_links);
+        all_links = realloc(all_links, current_length + href_length + 2);  // +2 for newline and null terminator
+        if (!all_links) {
+            perror("Error reallocating memory for all_links");
+            regfree(&regex);
+            free(buffer);
+            free(href_value);
+            return NULL;
+        }
+
+        // Append the new link and a newline to all_links
+        strcat(all_links, href_value);
+        strcat(all_links, "\n");
+
+        free(href_value);  // Free the temporary link
+
+        // Move cursor past the current match
+        cursor += matches[0].rm_eo;
+    }
+
+    regfree(&regex);
+    free(buffer);
+
+    return all_links;
+}
+
+void build_linked_list(const char *filename) {
     FILE *file = fopen(filename, "r");
     if (!file) {
         perror("Error opening file");
@@ -294,11 +409,11 @@ void extract_links(const char *filename) {
     buffer[file_size] = '\0';
     fclose(file);
 
-    // Regex pattern to match href attributes within anchor tags
-    const char *pattern = "<a\\s+[^>]*href=[\"']([^\"']*)[\"']";
+    // Regex pattern to match <a href=...> where the href may or may not be in quotes
+    const char *pattern = "<a\\s+href=[\"']?([^\"' >]+)[\"' >]";
 
     regex_t regex;
-    regmatch_t matches[2];  // Array to store the match groups (full match and the captured group)
+    regmatch_t matches[2];
     if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
         perror("Error compiling regex");
         free(buffer);
@@ -307,20 +422,19 @@ void extract_links(const char *filename) {
 
     char *cursor = buffer;
     while (regexec(&regex, cursor, 2, matches, 0) == 0) {
-        // Extract the href value
         int href_start = matches[1].rm_so;
         int href_end = matches[1].rm_eo;
         int href_length = href_end - href_start;
 
-        char href_value[href_length + 1];
+        // Allocate memory for the link and copy the href value
+        char *href_value = malloc(href_length + 1);
         strncpy(href_value, cursor + href_start, href_length);
         href_value[href_length] = '\0';  // Null-terminate the href value
 
-        // Check if the href_value starts with "http://" or "https://"
-        if (strncmp(href_value, "http://", 7) == 0 || strncmp(href_value, "https://", 8) == 0) {
-            // Print the extracted href value if it starts with http or https
-            printf("Found link: %s\n", href_value);
-        }
+        // Combine the base URL with the extracted link and append to the linked list
+        rebuild_and_append_url(href_value);
+
+        free(href_value);  // Free the temporary link
 
         // Move cursor past the current match
         cursor += matches[0].rm_eo;
@@ -330,17 +444,28 @@ void extract_links(const char *filename) {
     free(buffer);
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <URL> <output_file_name(example.txt / example.html)>\n", argv[0]);
-        return ERR_PARAM;
+int write_links(const char *filename, const char *links) {
+    if (filename == NULL || links == NULL) {
+        return ERR_PARAM;  // Handle invalid parameters
     }
 
-    char url[BUFFER_SIZE];
-    const char *output_file = argv[2]; 
+    FILE *file = fopen(filename, "w");
+    if (!file) {
+        perror("Error opening file to write links");
+        return ERR_FILE;
+    }
 
-    strncpy(url, argv[1], BUFFER_SIZE);
-    url[BUFFER_SIZE - 1] = '\0'; 
+    // Write all links to the file
+    fprintf(file, "%s", links);
+
+    fclose(file);
+    return SUCCESS;
+}
+
+int get_url_content(const char *url, const char *output_file) {
+    char current_url[BUFFER_SIZE];
+    strncpy(current_url, url, BUFFER_SIZE);
+    current_url[BUFFER_SIZE - 1] = '\0';  // Ensure null termination
 
     char response[BUFFER_SIZE];
     char redirect_location[BUFFER_SIZE];
@@ -358,8 +483,8 @@ int main(int argc, char *argv[]) {
     // Loop to handle redirects
     do {
         is_redirect = 0;
-        printf("Fetching URL: %s\n", url);
-        int fetch_result = fetch_url(url, response, file, &is_redirect, redirect_location);
+        printf("Fetching URL: %s\n", current_url);
+        int fetch_result = fetch_url(current_url, response, file, &is_redirect, redirect_location);
         if (fetch_result != SUCCESS) {
             fprintf(stderr, "Error fetching URL: %d\n", fetch_result);
             fclose(file);
@@ -368,20 +493,20 @@ int main(int argc, char *argv[]) {
 
         if (is_redirect) {
             printf("Redirecting to: %s\n", redirect_location);
-            int rebuild_result = rebuild_url(url, redirect_location, new_url);
+            int rebuild_result = rebuild_url(current_url, redirect_location, new_url);
             if (rebuild_result != SUCCESS) {
                 fprintf(stderr, "Error rebuilding URL: %d\n", rebuild_result);
                 fclose(file);
                 return rebuild_result;
             }
-            strncpy(url, new_url, BUFFER_SIZE);  // Update the URL to the new location
-            url[BUFFER_SIZE - 1] = '\0';  // Ensure null termination
+            strncpy(current_url, new_url, BUFFER_SIZE);  // Update the URL to the new location
+            current_url[BUFFER_SIZE - 1] = '\0';  // Ensure null termination
             redirect_count++;
         }
     } while (is_redirect && redirect_count < MAX_REDIRECTS);
 
     fclose(file);
-    
+
     if (redirect_count >= MAX_REDIRECTS) {
         printf("Too many redirects\n");
         return ERR_REDIRECT;
@@ -389,7 +514,54 @@ int main(int argc, char *argv[]) {
 
     printf("Response written to: %s\n", output_file);
 
-    extract_links(output_file);
+    // char *links = extract_links(output_file);
+
+    // printf("\nFetching links...\n\n");
+    // if (links != NULL) {
+    //     printf("All Links:\n%s", links);
+
+    //     // Write links to links.txt
+    //     int result = write_links("links.txt", links);
+    //     if (result == SUCCESS) {
+    //         printf("Links successfully written to links.txt\n");
+    //     } else {
+    //         printf("Error writing links to links.txt\n");
+    //     }
+
+    //     free(links);
+    // }
+
+    build_linked_list(output_file);
+
+    return SUCCESS;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <URL> <output_file_name(example.txt / example.html)>\n", argv[0]);
+        return ERR_PARAM;
+    }
+
+   int result = get_url_content(argv[1], argv[2]);
+    if (result != SUCCESS) {
+        return result;
+    }
+
+    // Print the list of URLs
+    printf("Extracted Links from linkedlist:\n");
+    url_node *current = url_list;
+    while (current != NULL) {
+        printf("%s\n", current->url);
+        current = current->next;
+    }
+
+    // Free the linked list
+    current = url_list;
+    while (current != NULL) {
+        url_node *next = current->next;
+        free(current);
+        current = next;
+    }
 
     return SUCCESS;
 }
