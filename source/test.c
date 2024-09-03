@@ -7,59 +7,223 @@
 #include <netdb.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <regex.h>
 
 #define MAX_REDIRECTS 5
 #define BUFFER_SIZE 8192
+#define MAX_CONCURRENT_CHILDREN 10
+#define INITIAL_ARRAY_SIZE 100
+#define MAX_CRAWL_DEPTH 1
 
-#define SUCCESS        0
-#define ERR_BASE       0
-#define ERR_PARAM     (ERR_BASE - 1)
-#define ERR_URL       (ERR_BASE - 2)
-#define ERR_CONNECT   (ERR_BASE - 3)
-#define ERR_SSL       (ERR_BASE - 4)
-#define ERR_REDIRECT  (ERR_BASE - 5)
-#define ERR_FILE      (ERR_BASE - 6)
-#define ERR_GAI       (ERR_BASE - 7)
-#define ERR_STAT_CODE (ERR_BASE - 8)
+#define SUCCESS          0
+#define ERR_BASE         0
+#define ERR_PARAM       (ERR_BASE-1)
+#define ERR_URL         (ERR_BASE-2)
+#define ERR_CONNECT     (ERR_BASE-3)
+#define ERR_SSL         (ERR_BASE-4)
+#define ERR_REDIRECT    (ERR_BASE-5)
+#define ERR_FILE        (ERR_BASE-6)
+#define ERR_GAI         (ERR_BASE-7)
+#define ERR_STAT_CODE   (ERR_BASE-8)
+#define ERR_MKDIR       (ERR_BASE-9)
+#define ERR_SHM_OPEN    (ERR_BASE-10)
+#define ERR_SHM_MAP     (ERR_BASE-11)
+#define ERR_SHM_UNLINK  (ERR_BASE-12)
+#define ERR_FORK        (ERR_BASE-13)
+#define ERR_WAIT        (ERR_BASE-14)
 
-typedef struct url_node {
-    char url[BUFFER_SIZE];
-    struct url_node *next;
-} url_node;
+#define MAX_URLS 100
+#define MAX_URL_LENGTH 1024
 
-struct url_node *url_list = NULL;
-char base_url[BUFFER_SIZE] = {0}; // To store the base URL
+typedef struct {
+    char crawled_urls[MAX_URLS][MAX_URL_LENGTH];
+    int crawled_count;
+    int status[MAX_URLS]; // 0: not_crawled, 1: can_crawl, 2: crawling, 3: crawled
+    int depth[MAX_URLS];
+} CrawledData;
 
-void append_url(url_node **head, const char *url) {
-    url_node *new_node = malloc(sizeof(url_node));
-    strncpy(new_node->url, url, BUFFER_SIZE);
-    new_node->next = NULL;
+CrawledData *crawled_data;
+char base_url[BUFFER_SIZE] = {0};
 
-    if (*head == NULL) {
-        *head = new_node;
-    } else {
-        url_node *current = *head;
-        while (current->next != NULL) {
-            current = current->next;
-        }
-        current->next = new_node;
+// Function prototypes
+int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, char *redirect_location);
+int rebuild_url(const char *current_url, const char *redirect_location, char *new_url);
+int already_crawled(CrawledData *data, const char *url);
+void build_crawled_data(CrawledData *data, const char *filename, int depth);
+void child_process(CrawledData *crawled_data, const char *url, int child_id, int depth);
+
+void log_url_and_file(const char *url, const char *filename) {
+    FILE *log_file = fopen("url_log.txt", "a");
+    if (log_file == NULL) {
+        perror("Failed to open log file");
+        return;
     }
+    fprintf(log_file, "URL: %s -> File: %s\n", url, filename);
+    fclose(log_file);
 }
 
-void rebuild_and_append_url(const char *href) {
+int get_url_content(const char *url, const char *output_file) {
+    char current_url[BUFFER_SIZE];
+    strncpy(current_url, url, BUFFER_SIZE);
+    current_url[BUFFER_SIZE - 1] = '\0';
+
+    char response[BUFFER_SIZE];
+    char redirect_location[BUFFER_SIZE];
+    char new_url[BUFFER_SIZE];
+    int is_redirect;
+    int redirect_count = 0;
+
+    FILE *file = fopen(output_file, "wb");
+    if (!file) {
+        perror("Failed to open file");
+        return ERR_FILE;
+    }
+
+    do {
+        is_redirect = 0;
+        printf("Fetching URL: %s\n", current_url);
+        int fetch_result = fetch_url(current_url, response, file, &is_redirect, redirect_location);
+        if (fetch_result != SUCCESS) {
+            fprintf(stderr, "Error fetching URL: %d\n", fetch_result);
+            fclose(file);
+            return fetch_result;
+        }
+
+        if (is_redirect) {
+            if (already_crawled(crawled_data, redirect_location) != -1) {
+                // Skip redirect if the URL was already crawled
+                printf("Skipping redirect to already crawled URL: %s\n", redirect_location);
+                fclose(file);
+                return ERR_REDIRECT;
+            }
+            printf("Redirecting to: %s\n", redirect_location);
+            int rebuild_result = rebuild_url(current_url, redirect_location, new_url);
+            if (rebuild_result != SUCCESS) {
+                fprintf(stderr, "Error rebuilding URL: %d\n", rebuild_result);
+                fclose(file);
+                return rebuild_result;
+            }
+            strncpy(current_url, new_url, BUFFER_SIZE);
+            current_url[BUFFER_SIZE - 1] = '\0';
+            redirect_count++;
+        }
+    } while (is_redirect && redirect_count < MAX_REDIRECTS);
+
+    fclose(file);
+
+    if (redirect_count >= MAX_REDIRECTS) {
+        printf("Too many redirects\n");
+        return ERR_REDIRECT;
+    }
+
+    printf("Response written to: %s\n", output_file);
+
+    return SUCCESS;
+}
+
+void append_url(CrawledData *data, const char *url, int depth) {
+    if (already_crawled(data, url) != -1) {
+        printf("Skipping duplicate URL: %s\n", url);
+        return;
+    }
+
+    if (data->crawled_count >= MAX_URLS) {
+        fprintf(stderr, "Maximum number of URLs exceeded.\n");
+        exit(ERR_BASE);
+    }
+    strncpy(data->crawled_urls[data->crawled_count], url, MAX_URL_LENGTH);
+    data->status[data->crawled_count] = 1; // Mark as can_crawl
+    data->depth[data->crawled_count] = depth;
+    data->crawled_count++;
+}
+
+void rebuild_and_append_url(CrawledData *data, const char *href, int depth) {
     char full_url[BUFFER_SIZE];
     
-    // Check if the href is a relative link or an absolute link
     if (strstr(href, "http://") || strstr(href, "https://")) {
-        // Absolute URL, no need to modify
         strncpy(full_url, href, BUFFER_SIZE);
     } else {
-        // Relative URL, combine with base_url
         snprintf(full_url, BUFFER_SIZE, "%s%s", base_url, href);
     }
 
-    append_url(&url_list, full_url);
+    append_url(data, full_url, depth);
+}
+
+void sanitize_filename(char *filename) {
+    for (int i = 0; filename[i]; i++) {
+        if (filename[i] == '/' || filename[i] == ':' || filename[i] == '?' || filename[i] == '&' || filename[i] == '=') {
+            filename[i] = '_';  // Replace problematic characters with '_'
+        }
+    }
+}
+
+void child_process(CrawledData *crawled_data, const char *url, int child_id, int depth) {
+    if (already_crawled(crawled_data, url) == 3) {
+        printf("Skipping already crawled URL: %s\n", url);
+        return;
+    }
+
+    const char *output_directory = "responses";
+    struct stat st = {0};
+
+    if (stat(output_directory, &st) == -1) {
+        if (mkdir(output_directory, 0700) != 0) {
+            perror("Failed to create output directory");
+            exit(ERR_MKDIR);
+        }
+    }
+
+    char sanitized_url[BUFFER_SIZE];
+    strncpy(sanitized_url, url, BUFFER_SIZE);
+    sanitize_filename(sanitized_url);
+
+    char output_file[BUFFER_SIZE];
+    snprintf(output_file, BUFFER_SIZE, "%s/%s.html", output_directory, sanitized_url);
+
+    printf("Output file for URL %s is %s\n", url, output_file);
+
+    int result = get_url_content(url, output_file);
+    if (result == SUCCESS) {
+        log_url_and_file(url, output_file);
+
+        for (int i = 0; i < crawled_data->crawled_count; i++) {
+            if (strcmp(crawled_data->crawled_urls[i], url) == 0) {
+                crawled_data->status[i] = 3;
+            }
+        }
+
+        if (depth < MAX_CRAWL_DEPTH) { 
+            build_crawled_data(crawled_data, output_file, depth + 1);
+
+            int new_child_id = crawled_data->crawled_count;
+            while (new_child_id <= crawled_data->crawled_count) {
+                if (already_crawled(crawled_data, crawled_data->crawled_urls[new_child_id - 1]) == 3) {
+                    new_child_id++;
+                    continue;
+                }
+
+                pid_t pid = fork();
+                if (pid == -1) {
+                    perror("Fork failed");
+                    exit(ERR_FORK);
+                } else if (pid == 0) {
+                    child_process(crawled_data, crawled_data->crawled_urls[new_child_id - 1], new_child_id, depth + 1);
+                    exit(SUCCESS);
+                } else {
+                    wait(NULL);
+                    new_child_id++;
+                }
+            }
+        }
+    } else {
+        fprintf(stderr, "Failed to fetch content for URL: %s\n", url);
+    }
+    exit(result);
 }
 
 int parse_url(const char *url, char *hostname, char *path) {
@@ -104,7 +268,7 @@ int print_status_code(const char *response) {
     const char *status_line = strstr(response, "HTTP/1.");
     if (status_line) {
         char status_code[4];
-        strncpy(status_code, status_line + 9, 3);  //skip HTTP/1.x
+        strncpy(status_code, status_line + 9, 3);
         status_code[3] = '\0'; 
         return atoi(status_code);
     }
@@ -119,15 +283,13 @@ int rebuild_url(const char *current_url, const char *redirect_location, char *ne
     }
 
     if (strstr(redirect_location, "http://") || strstr(redirect_location, "https://")) {
-        // If the redirect location is an absolute URL
         strncpy(new_url, redirect_location, BUFFER_SIZE - 1);
         new_url[BUFFER_SIZE - 1] = '\0';
     } else {
-        // Get base URL (scheme + host + optional port)
         const char *scheme_end = strstr(current_url, "://");
         if (!scheme_end) return ERR_URL;
 
-        scheme_end += 3; // Skip past "://"
+        scheme_end += 3;
         const char *path_start = strchr(scheme_end, '/');
         size_t base_length = path_start ? (path_start - current_url) : strlen(current_url);
 
@@ -232,9 +394,12 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
                     header_done = 1;
 
                     int status_code = print_status_code(response);
-                    printf("Status Code : %d\n",status_code);
+                    printf("Status Code : %d\n", status_code);
 
-                    // Check for redirect
+                    if (status_code == 200) {
+                        strncpy(base_url, url, BUFFER_SIZE);
+                    }
+
                     if (status_code == 301 || status_code == 302) {
                         *is_redirect = 1;
                         char *location = strstr(response, "Location:");
@@ -278,9 +443,12 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
                     header_done = 1;
 
                     int status_code = print_status_code(response);
-                    printf("Status Code : %d\n",status_code);
+                    printf("Status Code : %d\n", status_code);
 
-                    // Check for redirect
+                    if (status_code == 200) {
+                        strncpy(base_url, url, BUFFER_SIZE);
+                    }
+
                     if (status_code == 301 || status_code == 302) {
                         *is_redirect = 1;
                         char *location = strstr(response, "Location:");
@@ -310,90 +478,13 @@ int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, cha
     return SUCCESS;
 }
 
-char *extract_links(const char *filename) {
-    FILE *file = fopen(filename, "r");
-    if (!file) {
-        perror("Error opening file");
-        return NULL;
-    }
-
-    // Read the entire file into a buffer
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    char *buffer = malloc(file_size + 1);
-    if (!buffer) {
-        perror("Error allocating memory");
-        fclose(file);
-        return NULL;
-    }
-
-    fread(buffer, 1, file_size, file);
-    buffer[file_size] = '\0';
-    fclose(file);
-
-    // Regex pattern to match <a href=...> where the href may or may not be in quotes
-    const char *pattern = "<a\\s+href=[\"']?([^\"' >]+)[\"' >]";
-
-    regex_t regex;
-    regmatch_t matches[2];
-    if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
-        perror("Error compiling regex");
-        free(buffer);
-        return NULL;
-    }
-
-    // String to accumulate all links found
-    char *all_links = malloc(1);  // Start with an empty string
-    all_links[0] = '\0';  // Null-terminate the empty string
-
-    char *cursor = buffer;
-    while (regexec(&regex, cursor, 2, matches, 0) == 0) {
-        int href_start = matches[1].rm_so;
-        int href_end = matches[1].rm_eo;
-        int href_length = href_end - href_start;
-
-        // Allocate memory for the link and copy the href value
-        char *href_value = malloc(href_length + 1);
-        strncpy(href_value, cursor + href_start, href_length);
-        href_value[href_length] = '\0';  // Null-terminate the href value
-
-        // Reallocate all_links to hold the new link plus a newline character
-        size_t current_length = strlen(all_links);
-        all_links = realloc(all_links, current_length + href_length + 2);  // +2 for newline and null terminator
-        if (!all_links) {
-            perror("Error reallocating memory for all_links");
-            regfree(&regex);
-            free(buffer);
-            free(href_value);
-            return NULL;
-        }
-
-        // Append the new link and a newline to all_links
-        strcat(all_links, href_value);
-        strcat(all_links, "\n");
-
-        free(href_value);  // Free the temporary link
-
-        // Move cursor past the current match
-        cursor += matches[0].rm_eo;
-    }
-
-    regfree(&regex);
-    free(buffer);
-
-    return all_links;
-}
-
-void build_linked_list(const char *filename) {
+void build_crawled_data(CrawledData *data, const char *filename, int depth) {
     FILE *file = fopen(filename, "r");
     if (!file) {
         perror("Error opening file");
         return;
     }
 
-    // Read the entire file into a buffer
     fseek(file, 0, SEEK_END);
     long file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
@@ -409,7 +500,6 @@ void build_linked_list(const char *filename) {
     buffer[file_size] = '\0';
     fclose(file);
 
-    // Regex pattern to match <a href=...> where the href may or may not be in quotes
     const char *pattern = "<a\\s+href=[\"']?([^\"' >]+)[\"' >]";
 
     regex_t regex;
@@ -426,17 +516,13 @@ void build_linked_list(const char *filename) {
         int href_end = matches[1].rm_eo;
         int href_length = href_end - href_start;
 
-        // Allocate memory for the link and copy the href value
         char *href_value = malloc(href_length + 1);
         strncpy(href_value, cursor + href_start, href_length);
-        href_value[href_length] = '\0';  // Null-terminate the href value
+        href_value[href_length] = '\0';
 
-        // Combine the base URL with the extracted link and append to the linked list
-        rebuild_and_append_url(href_value);
+        rebuild_and_append_url(data, href_value, depth);
 
-        free(href_value);  // Free the temporary link
-
-        // Move cursor past the current match
+        free(href_value);
         cursor += matches[0].rm_eo;
     }
 
@@ -444,124 +530,87 @@ void build_linked_list(const char *filename) {
     free(buffer);
 }
 
-int write_links(const char *filename, const char *links) {
-    if (filename == NULL || links == NULL) {
-        return ERR_PARAM;  // Handle invalid parameters
-    }
-
-    FILE *file = fopen(filename, "w");
-    if (!file) {
-        perror("Error opening file to write links");
-        return ERR_FILE;
-    }
-
-    // Write all links to the file
-    fprintf(file, "%s", links);
-
-    fclose(file);
-    return SUCCESS;
-}
-
-int get_url_content(const char *url, const char *output_file) {
-    char current_url[BUFFER_SIZE];
-    strncpy(current_url, url, BUFFER_SIZE);
-    current_url[BUFFER_SIZE - 1] = '\0';  // Ensure null termination
-
-    char response[BUFFER_SIZE];
-    char redirect_location[BUFFER_SIZE];
-    char new_url[BUFFER_SIZE];
-    int is_redirect;
-    int redirect_count = 0;
-
-    // Open the output file specified in the command line argument
-    FILE *file = fopen(output_file, "wb");
-    if (!file) {
-        perror("Failed to open file");
-        return ERR_FILE;
-    }
-
-    // Loop to handle redirects
-    do {
-        is_redirect = 0;
-        printf("Fetching URL: %s\n", current_url);
-        int fetch_result = fetch_url(current_url, response, file, &is_redirect, redirect_location);
-        if (fetch_result != SUCCESS) {
-            fprintf(stderr, "Error fetching URL: %d\n", fetch_result);
-            fclose(file);
-            return fetch_result;
+int already_crawled(CrawledData *data, const char *url) {
+    for (int i = 0; i < data->crawled_count; i++) {
+        if (strcmp(data->crawled_urls[i], url) == 0) {
+            return data->status[i];
         }
-
-        if (is_redirect) {
-            printf("Redirecting to: %s\n", redirect_location);
-            int rebuild_result = rebuild_url(current_url, redirect_location, new_url);
-            if (rebuild_result != SUCCESS) {
-                fprintf(stderr, "Error rebuilding URL: %d\n", rebuild_result);
-                fclose(file);
-                return rebuild_result;
-            }
-            strncpy(current_url, new_url, BUFFER_SIZE);  // Update the URL to the new location
-            current_url[BUFFER_SIZE - 1] = '\0';  // Ensure null termination
-            redirect_count++;
-        }
-    } while (is_redirect && redirect_count < MAX_REDIRECTS);
-
-    fclose(file);
-
-    if (redirect_count >= MAX_REDIRECTS) {
-        printf("Too many redirects\n");
-        return ERR_REDIRECT;
     }
-
-    printf("Response written to: %s\n", output_file);
-
-    // char *links = extract_links(output_file);
-
-    // printf("\nFetching links...\n\n");
-    // if (links != NULL) {
-    //     printf("All Links:\n%s", links);
-
-    //     // Write links to links.txt
-    //     int result = write_links("links.txt", links);
-    //     if (result == SUCCESS) {
-    //         printf("Links successfully written to links.txt\n");
-    //     } else {
-    //         printf("Error writing links to links.txt\n");
-    //     }
-
-    //     free(links);
-    // }
-
-    build_linked_list(output_file);
-
-    return SUCCESS;
+    return -1;
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <URL> <output_file_name(example.txt / example.html)>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <URL> <output_file_name(example.txt)>\n", argv[0]);
         return ERR_PARAM;
     }
 
-   int result = get_url_content(argv[1], argv[2]);
+    int shm_fd = shm_open("/my_shared_memory", O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("Failed to open shared memory");
+        return ERR_SHM_OPEN;
+    }
+
+    if (ftruncate(shm_fd, sizeof(CrawledData)) == -1) {
+        perror("Failed to resize shared memory");
+        shm_unlink("/my_shared_memory");
+        return ERR_SHM_UNLINK;
+    }
+
+    crawled_data = mmap(NULL, sizeof(CrawledData), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (crawled_data == MAP_FAILED) {
+        perror("Failed to map shared memory");
+        shm_unlink("/my_shared_memory");
+        return ERR_SHM_MAP;
+    }
+    memset(crawled_data, 0, sizeof(CrawledData));
+
+    int result = get_url_content(argv[1], argv[2]);
     if (result != SUCCESS) {
         return result;
     }
 
-    // Print the list of URLs
-    printf("Extracted Links from linkedlist:\n");
-    url_node *current = url_list;
-    while (current != NULL) {
-        printf("%s\n", current->url);
-        current = current->next;
+    build_crawled_data(crawled_data, argv[2], 1);
+
+    int child_count = 0;
+    int child_id = 1;
+    while (child_id <= crawled_data->crawled_count) {
+        if (already_crawled(crawled_data, crawled_data->crawled_urls[child_id - 1]) == 3) {
+            child_id++;
+            continue;
+        }
+
+        if (child_count >= MAX_CONCURRENT_CHILDREN) {
+            printf("-------\nWaiting for child process\n-------\n");
+            wait(NULL);
+            child_count--;
+        }
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            perror("Fork failed");
+            return ERR_FORK;
+        } else if (pid == 0) {
+            child_process(crawled_data, crawled_data->crawled_urls[child_id - 1], child_id, 1);
+        } else {
+            child_count++;
+            child_id++;
+        }
     }
 
-    // Free the linked list
-    current = url_list;
-    while (current != NULL) {
-        url_node *next = current->next;
-        free(current);
-        current = next;
+    while (child_count > 0) {
+        printf("-------\nWaiting for child process\n-------\n");
+        wait(NULL);
+        child_count--;
     }
+
+    printf("Final Extracted Links from array:\n");
+    for (int i = 0; i < crawled_data->crawled_count; i++) {
+        printf("%s\n", crawled_data->crawled_urls[i]);
+    }
+
+    munmap(crawled_data, sizeof(CrawledData));
+    shm_unlink("/my_shared_memory");
 
     return SUCCESS;
 }
