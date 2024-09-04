@@ -13,10 +13,13 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <regex.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdbool.h>
 
 #define MAX_REDIRECTS 5
 #define BUFFER_SIZE 8192
-#define MAX_CONCURRENT_CHILDREN 10
+#define MAX_CONCURRENT_CHILDREN 3
 #define INITIAL_ARRAY_SIZE 100
 #define MAX_CRAWL_DEPTH 1
 
@@ -49,13 +52,14 @@ typedef struct {
 
 CrawledData *crawled_data;
 char base_url[BUFFER_SIZE] = {0};
+sem_t sem; 
 
 // Function prototypes
 int fetch_url(const char *url, char *response, FILE *file, int *is_redirect, char *redirect_location);
 int rebuild_url(const char *current_url, const char *redirect_location, char *new_url);
 int already_crawled(CrawledData *data, const char *url);
 void build_crawled_data(CrawledData *data, const char *filename, int depth);
-void child_process(CrawledData *crawled_data, const char *url, int child_id, int depth);
+void child_process(CrawledData *crawled_data);
 
 void log_url_and_file(const char *url, const char *filename) {
     FILE *log_file = fopen("url_log.txt", "a");
@@ -162,68 +166,36 @@ void sanitize_filename(char *filename) {
     }
 }
 
-void child_process(CrawledData *crawled_data, const char *url, int child_id, int depth) {
-    if (already_crawled(crawled_data, url) == 3) {
-        printf("Skipping already crawled URL: %s\n", url);
-        return;
-    }
-
-    const char *output_directory = "responses";
-    struct stat st = {0};
-
-    if (stat(output_directory, &st) == -1) {
-        if (mkdir(output_directory, 0700) != 0) {
-            perror("Failed to create output directory");
-            exit(ERR_MKDIR);
-        }
-    }
-
-    char sanitized_url[BUFFER_SIZE];
-    strncpy(sanitized_url, url, BUFFER_SIZE);
-    sanitize_filename(sanitized_url);
-
-    char output_file[BUFFER_SIZE];
-    snprintf(output_file, BUFFER_SIZE, "%s/%s.html", output_directory, sanitized_url);
-
-    printf("Output file for URL %s is %s\n", url, output_file);
-
-    int result = get_url_content(url, output_file);
-    if (result == SUCCESS) {
-        log_url_and_file(url, output_file);
-
+void child_process(CrawledData *crawled_data) {
+    while (true) {
+        sem_wait(&sem);
+        int url_index = -1;
         for (int i = 0; i < crawled_data->crawled_count; i++) {
-            if (strcmp(crawled_data->crawled_urls[i], url) == 0) {
-                crawled_data->status[i] = 3;
+            if (crawled_data->status[i] == 1) {  // can_crawl
+                url_index = i;
+                crawled_data->status[i] = 2;  // crawling
+                break;
             }
         }
+        sem_post(&sem);
 
-        if (depth < MAX_CRAWL_DEPTH) { 
-            build_crawled_data(crawled_data, output_file, depth + 1);
-
-            int new_child_id = crawled_data->crawled_count;
-            while (new_child_id <= crawled_data->crawled_count) {
-                if (already_crawled(crawled_data, crawled_data->crawled_urls[new_child_id - 1]) == 3) {
-                    new_child_id++;
-                    continue;
-                }
-
-                pid_t pid = fork();
-                if (pid == -1) {
-                    perror("Fork failed");
-                    exit(ERR_FORK);
-                } else if (pid == 0) {
-                    child_process(crawled_data, crawled_data->crawled_urls[new_child_id - 1], new_child_id, depth + 1);
-                    exit(SUCCESS);
-                } else {
-                    wait(NULL);
-                    new_child_id++;
-                }
-            }
+        if (url_index == -1) {
+            break;  // No more URLs to crawl
         }
-    } else {
-        fprintf(stderr, "Failed to fetch content for URL: %s\n", url);
+
+        const char *url = crawled_data->crawled_urls[url_index];
+        // Crawl the URL as before
+        char output_file[PATH_MAX];
+        snprintf(output_file, sizeof(output_file), "output_%d.html", url_index);
+        if (get_url_content(url, output_file) == SUCCESS) {
+            // Update log and status after successful crawl
+            log_url_and_file(url, output_file);
+
+            sem_wait(&sem);
+            crawled_data->status[url_index] = 3;  // crawled
+            sem_post(&sem);
+        }
     }
-    exit(result);
 }
 
 int parse_url(const char *url, char *hostname, char *path) {
@@ -541,7 +513,7 @@ int already_crawled(CrawledData *data, const char *url) {
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <URL> <output_file_name(example.txt)>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <URL> <output_file_name>\n", argv[0]);
         return ERR_PARAM;
     }
 
@@ -565,50 +537,27 @@ int main(int argc, char *argv[]) {
     }
     memset(crawled_data, 0, sizeof(CrawledData));
 
-    int result = get_url_content(argv[1], argv[2]);
-    if (result != SUCCESS) {
-        return result;
-    }
+    // Semaphore initialization
+    sem_init(&sem, 1, 1);
 
-    build_crawled_data(crawled_data, argv[2], 1);
-
-    int child_count = 0;
-    int child_id = 1;
-    while (child_id <= crawled_data->crawled_count) {
-        if (already_crawled(crawled_data, crawled_data->crawled_urls[child_id - 1]) == 3) {
-            child_id++;
-            continue;
-        }
-
-        if (child_count >= MAX_CONCURRENT_CHILDREN) {
-            printf("-------\nWaiting for child process\n-------\n");
-            wait(NULL);
-            child_count--;
-        }
-
-        pid_t pid = fork();
-        if (pid == -1) {
-            perror("Fork failed");
-            return ERR_FORK;
-        } else if (pid == 0) {
-            child_process(crawled_data, crawled_data->crawled_urls[child_id - 1], child_id, 1);
-        } else {
-            child_count++;
-            child_id++;
+    // Spawn child processes
+    pid_t pids[MAX_CONCURRENT_CHILDREN];
+    for (int i = 0; i < MAX_CONCURRENT_CHILDREN; i++) {
+        pids[i] = fork();
+        if (pids[i] == 0) { // Child
+            child_process(crawled_data, &sem);
+            exit(SUCCESS);
         }
     }
 
-    while (child_count > 0) {
-        printf("-------\nWaiting for child process\n-------\n");
-        wait(NULL);
-        child_count--;
+    // Wait for all children to finish
+    for (int i = 0; i < MAX_CONCURRENT_CHILDREN; i++) {
+        int status;
+        waitpid(pids[i], &status, 0);
     }
 
-    printf("Final Extracted Links from array:\n");
-    for (int i = 0; i < crawled_data->crawled_count; i++) {
-        printf("%s\n", crawled_data->crawled_urls[i]);
-    }
-
+    // Cleanup
+    sem_destroy(&sem);
     munmap(crawled_data, sizeof(CrawledData));
     shm_unlink("/my_shared_memory");
 
