@@ -74,7 +74,7 @@
 typedef struct {
     char crawled_urls[MAX_URLS][MAX_URL_LENGTH];
     int crawled_count;
-    int status[MAX_URLS]; // 0: not_crawled, 1: can_crawl 2: crawling, 3: crawled
+    int status[MAX_URLS]; // 1: NOT_CRAWLED 2: CRAWLING, 3: CRAWLED
     int depth[MAX_URLS];
 } CrawledData;
 
@@ -175,15 +175,16 @@ int crawled(int depth, const char *url) {
     sem_wait(sem);
     for (int i = 0; i < crawled_data->crawled_count; i++) {
         if (strcmp(crawled_data->crawled_urls[i], url) == 0) {
+            crawled_data->status[i] = CRAWLED;  // Mark as crawled
             sem_post(sem);
-            return crawled_data->status[i];
+            return ERR_ALREADY_CRAWLED;
         }
     }
 
     if (crawled_data->crawled_count < MAX_URLS) {
         printf("Adding URL: %s\n", url);
         strcpy(crawled_data->crawled_urls[crawled_data->crawled_count], url);
-        crawled_data->status[crawled_data->crawled_count] = NOT_CRAWLED;
+        crawled_data->status[crawled_data->crawled_count] = NOT_CRAWLED;  // Mark as not yet crawled
         crawled_data->depth[crawled_data->crawled_count] = depth + 1;
         crawled_data->crawled_count++;
         sem_post(sem);
@@ -193,9 +194,8 @@ int crawled(int depth, const char *url) {
         fprintf(stderr, "Maximum number of URLs exceeded.\n");
         return ERR_MAX_URLS;
     }
-
-    return ERR_ALREADY_CRAWLED;
 }
+
 
 int parse_html(const char *html_content, int depth, const char *base_url) {
     const char *a_tag_start = "<a href=";
@@ -256,7 +256,14 @@ int parse_html(const char *html_content, int depth, const char *base_url) {
             sprintf(full_url, "https://%s/%s/%s", hostname, path, href);
         }
 
-        crawled(depth, full_url);
+        int status = crawled(depth, full_url);
+        if (status == ERR_ALREADY_CRAWLED || status == CRAWLING || status == CRAWLED) {
+            // If the URL is already processed, skip further processing
+            free(href);
+            free(full_url);
+            pos = end + 1;
+            continue;  // Skip to the next URL
+        }
 
         free(href);
         free(full_url);
@@ -632,6 +639,8 @@ int get_and_parse(char *url, int depth, SSL_CTX *ctx) {
             }
         }
         sem_post(sem);
+    } else {
+        return result;  // Return the error if get_url() failed
     }
 
     if (strcmp(url_type, "html") == 0 && depth < MAX_DEPTH) {
@@ -665,10 +674,14 @@ int get_and_parse(char *url, int depth, SSL_CTX *ctx) {
         fread(response, 1, file_size, file);
         response[file_size] = '\0';
 
-        parse_html(response, depth, final_url);
-
+        result = parse_html(response, depth, final_url);
         free(response);
         fclose(file);
+
+        if (result != SUCCESS) {
+            fprintf(stderr, "Error parsing HTML for URL: %s\n", url);
+            return result;
+        }
     }
 
     return SUCCESS;
