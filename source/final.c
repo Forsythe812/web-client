@@ -71,6 +71,9 @@
 #define CRAWLING        2
 #define CRAWLED         3
 
+#define TRUE            1
+#define FALSE           0
+
 typedef struct {
     char crawled_urls[MAX_URLS][MAX_URL_LENGTH];
     int crawled_count;
@@ -219,7 +222,7 @@ int parse_html(const char *html_content, int depth, const char *base_url) {
         }
     }
 
-    while ((pos = strstr(pos, a_tag_start)) != NULL && crawled_data->crawled_count < MAX_URLS) {
+    while ((pos = strstr(pos, a_tag_start)) != NULL) {
         pos = strstr(pos, a_tag_start);
         if (pos == NULL) {
             break;
@@ -257,8 +260,15 @@ int parse_html(const char *html_content, int depth, const char *base_url) {
         }
 
         int status = crawled(depth, full_url);
+
+        if (status == ERR_MAX_URLS) {
+            fprintf(stderr, "Maximum URL limit reached. Stopping further processing.\n");
+            free(href);
+            free(full_url);
+            break;
+        }
+
         if (status == ERR_ALREADY_CRAWLED || status == CRAWLING || status == CRAWLED) {
-            // If the URL is already processed, skip further processing
             free(href);
             free(full_url);
             pos = end + 1;
@@ -273,123 +283,9 @@ int parse_html(const char *html_content, int depth, const char *base_url) {
     return SUCCESS;
 }
 
-int read_response(int is_https, SSL *ssl, int sockfd, char *url, int depth, char *temp, char **url_type) {
-    char buffer[BUFFER_SIZE];
-    int bytes_read = 0, is_chunked = 0, is_html = 0;
-    char *header_end, *content_type, *response, *chunk_start, *chunk_end, *file_type;
-    size_t response_len = 0, chunk_size;
-
-    bytes_read = (is_https ? SSL_read(ssl, buffer, sizeof(buffer)) : recv(sockfd, buffer, sizeof(buffer), 0));
-    if (bytes_read <= 0) {
-        return ERR_READ_WEB;
-    }
-    buffer[bytes_read] = '\0';
-    
-    int status_code = -1;
-    sscanf(buffer, "HTTP/1.1 %d", &status_code);
-
-    // Handle redirection (HTTP 3xx)
-    if (status_code >= 300 && status_code < 400) {
-        printf("HTTP Status Code: %d\n", status_code);
-        if (temp != NULL) {
-            strncpy(temp, buffer, bytes_read);
-            temp[bytes_read] = '\0';
-        }
-        return ERR_FETCH_URL;
-    } else if (status_code >= 200 && status_code < 300) {
-        printf("HTTP Status Code: %d\n", status_code);
-        memset(temp, 0, BUFFER_SIZE);
-    } else {
-        printf("HTTP Status Code: %d\n", status_code);
-        return ERR_HTTP_STATUS;
-    }
-
-    // Check if the response is chunked
-    if (strstr(buffer, "\r\nTransfer-Encoding: chunked")) {
-        is_chunked = 1;
-    }
-
-    // Check if the content type is HTML
-    if (strstr(buffer, "\r\nContent-Type: text/html")) {
-        is_html = 1;
-        file_type = ".html";
-        *url_type = "html";
-    } else {
-        *url_type = "unknown";  // Skip non-HTML content
-        return ERR_FILE_TYPE;
-    }
-
-    // Process HTML content
-    if (is_html) {
-        response = malloc(sizeof(char) * (bytes_read + 1));
-        if (response == NULL) {
-            fprintf(stderr, "Memory allocation error\n");
-            if (is_https) {
-                SSL_free(ssl);
-            }
-            close(sockfd);
-            return ERR_OUT_OF_MEM;
-        }
-
-        memcpy(response, buffer, bytes_read);
-        response_len += bytes_read;
-        response[response_len] = '\0';
-
-        // Continue reading the rest of the response
-        while ((bytes_read = (is_https ? SSL_read(ssl, buffer, sizeof(buffer)) : recv(sockfd, buffer, sizeof(buffer), 0))) > 0) {
-            response = realloc(response, response_len + bytes_read + 1);
-            if (response == NULL) {
-                fprintf(stderr, "Memory allocation error\n");
-                if (is_https) {
-                    SSL_free(ssl);
-                }
-                close(sockfd);
-                return ERR_OUT_OF_MEM;
-            }
-            memcpy(response + response_len, buffer, bytes_read);
-            response_len += bytes_read;
-            response[response_len] = '\0';
-        }
-
-        // Save the HTML content
-        char *body_start = strstr(response, "<body");
-        if (body_start) {
-            body_start = strchr(body_start, '>');
-            if (body_start) {
-                body_start += 1;
-            }
-        } else {
-            body_start = response;
-        }
-
-        char *body_end = strstr(body_start, "</body>");
-        if (body_end) {
-            *body_end = '\0';
-        }
-
-        char filename[FILE_PATH];
-        char *save_filename = sanitize_filename(url);
-        snprintf(filename, sizeof(filename), "%s/%s%s", output_dir, save_filename, file_type);
-        free(save_filename);
-
-        FILE *fp = fopen(filename, "wb");
-        if (fp) {
-            fwrite(body_start, 1, strlen(body_start), fp);
-            fclose(fp);
-            printf("HTML Response saved to %s\n", filename);
-        } else {
-            fprintf(stderr, "Failed to save HTML response to file: %s\n", filename);
-        }
-
-        free(response);  
-    }
-
-    return SUCCESS;
-}
-
 int parse_response(int is_https, SSL *ssl, int sockfd, char *url, int depth, char *temp, char **url_type) {
     char buffer[BUFFER_SIZE];
-    int bytes_read = 0, is_chunked = 0;
+    int bytes_read = 0, is_chunked = FALSE;
     char *header_end, *response, *chunk_start, *chunk_end, *file_type;
     size_t response_len = 0, chunk_size;
 
@@ -412,21 +308,17 @@ int parse_response(int is_https, SSL *ssl, int sockfd, char *url, int depth, cha
             temp[bytes_read] = '\0';
         }
         return ERR_FETCH_URL;
-    } 
-    
-    // Handle successful response (2xx status codes)
-    if (status_code >= 200 && status_code < 300) {
+    } else if (status_code >= 200 && status_code < 300) {
         printf("HTTP Status Code: %d\n", status_code);
         memset(temp, 0, BUFFER_SIZE);
     } else {
-        // Unhandled status codes
         printf("HTTP Status Code: %d\n", status_code);
         return ERR_HTTP_STATUS;
     }
 
     // Check if the response is chunked
     if (strstr(buffer, "\r\nTransfer-Encoding: chunked")) {
-        is_chunked = 1;
+        is_chunked = TRUE;
     }
 
     // Check if the content type is HTML
@@ -511,7 +403,7 @@ int parse_response(int is_https, SSL *ssl, int sockfd, char *url, int depth, cha
     // Save HTML content to a file
     char filename[FILE_PATH];
     char *save_filename = sanitize_filename(url);
-    snprintf(filename, sizeof(filename), "%s/depth_%d_%s%s", output_dir, depth, save_filename, file_type);
+    snprintf(filename, sizeof(filename), "%s/%s%s", output_dir, save_filename, file_type);
     free(save_filename);
 
     FILE *fp = fopen(filename, "wb");
@@ -538,7 +430,7 @@ int get_url(char *url, SSL_CTX *ctx, int depth, int count, char **final_url, cha
     char hostname[HOST_SIZE] = "";
     char path[PATH_SIZE] = "";
     char port[PORT_SIZE] = "";
-    int is_https = 0, result;
+    int is_https = FALSE, result;
     if (strncmp(url, "http://", 7) == 0) {
         sscanf(url, "http://%255[^:/]/%255[^\n]", hostname, path);
     } else if (strncmp(url, "https://", 8) == 0) {
@@ -549,7 +441,7 @@ int get_url(char *url, SSL_CTX *ctx, int depth, int count, char **final_url, cha
         return ERR_FETCH_URL;
     }
 
-    is_https == 0 ? strcpy(port, "80") : strcpy(port, "443");
+    is_https == FALSE ? strcpy(port, "80") : strcpy(port, "443");
     if (strlen(path) == 0) strcpy(path, "/");
     int sockfd = create_socket(hostname, port);
     if (sockfd < 0) {
@@ -559,7 +451,7 @@ int get_url(char *url, SSL_CTX *ctx, int depth, int count, char **final_url, cha
     char *new_location = NULL;
     char buffer[BUFFER_SIZE], temp[BUFFER_SIZE];
     int bytes;
-    int is_chunked = 0;
+    int is_chunked = FALSE;
 
     char request[REQUEST_SIZE];
     snprintf(request, sizeof(request),
@@ -580,11 +472,11 @@ int get_url(char *url, SSL_CTX *ctx, int depth, int count, char **final_url, cha
         }
         
         SSL_write(ssl, request, strlen(request));
-        result = read_response(1, ssl, sockfd, url, depth, temp, url_type);
+        result = parse_response(TRUE, ssl, sockfd, url, depth, temp, url_type);
         SSL_free(ssl);
     } else {
         send(sockfd, request, strlen(request), 0);
-        result = read_response(0, NULL, sockfd, url, depth, temp, url_type);
+        result = parse_response(FALSE, NULL, sockfd, url, depth, temp, url_type);
     }
 
     close(sockfd);
@@ -629,16 +521,26 @@ int get_and_parse(char *url, int depth, SSL_CTX *ctx) {
     char *final_url = NULL;
     char *url_type = NULL;
     int result = get_url(url, ctx, depth, count, &final_url, &url_type);
+    // if (result == SUCCESS) {
+    //     sem_wait(sem);
+    //     for (int i = 0; i < crawled_data->crawled_count; i++) {
+    //         if (strcmp(crawled_data->crawled_urls[i], url) == 0) {
+    //             crawled_data->status[i] = CRAWLED;
+    //             printf("crawled: %s\n", crawled_data->crawled_urls[i]);
+    //             break;
+    //         }
+    //     }
+    //     sem_post(sem);
+    // } else {
+    //     return result;  // Return the error if get_url() failed
+    // }
+
     if (result == SUCCESS) {
-        sem_wait(sem);
-        for (int i = 0; i < crawled_data->crawled_count; i++) {
-            if (strcmp(crawled_data->crawled_urls[i], url) == 0) {
-                crawled_data->status[i] = CRAWLED;
-                printf("crawled: %s\n", crawled_data->crawled_urls[i]);
-                break;
-            }
+        int crawl_status = crawled(depth, url);
+        if (crawl_status != SUCCESS && crawl_status != ERR_ALREADY_CRAWLED) {
+            fprintf(stderr, "Error marking URL as crawled: %s\n", url);
+            return crawl_status;
         }
-        sem_post(sem);
     } else {
         return result;  // Return the error if get_url() failed
     }
@@ -692,18 +594,18 @@ void child_process (SSL_CTX *ctx, int id) {
         sem_wait(sem);
         char *url_to_crawl = NULL;
         int depth;
-        int can_crawl = 0;
-        int all_crawled = 1;
+        int can_crawl = FALSE;
+        int all_crawled = TRUE;
         for (int i = 0; i < crawled_data->crawled_count; i++) {
             if (crawled_data->status[i] != CRAWLED) {
-                all_crawled = 0;
+                all_crawled = FALSE;
             }
 
             if (crawled_data->status[i] == NOT_CRAWLED) {
                 url_to_crawl = crawled_data->crawled_urls[i];
                 depth = crawled_data->depth[i];
                 crawled_data->status[i] = CRAWLING;
-                can_crawl = 1;
+                can_crawl = TRUE;
                 break;
             }
         }
@@ -714,11 +616,11 @@ void child_process (SSL_CTX *ctx, int id) {
             break;
         }
         
-        if (url_to_crawl && can_crawl == 1) {
+        if (url_to_crawl && can_crawl == TRUE) {
             printf("Child %d processing URL: %s\n", id, url_to_crawl);
             get_and_parse(url_to_crawl, depth, ctx);
         } else {
-            sleep(3);
+            sleep(2);
         }
     }
     exit(SUCCESS);
